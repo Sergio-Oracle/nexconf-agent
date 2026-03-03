@@ -1,0 +1,17 @@
+{
+  "name": "nexconf-agent",
+  "version": "1.0.0",
+  "description": "Agent Bureau à Distance NexConf",
+  "type": "module",
+  "main": "remote-agent.js",
+  "scripts": {
+    "start": "node remote-agent.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "robotjs": "^0.6.0",
+    "screenshot-desktop": "^1.12.7",
+    "sharp": "^0.33.2",
+    "dotenv": "^16.3.1"
+  }
+}
