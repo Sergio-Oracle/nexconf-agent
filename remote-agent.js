@@ -8,7 +8,7 @@
 //   node remote-agent.js --server wss://nexconf.ddns.net --session VOTRE_CODE
 //
 // Options :
-//   --fps     : frames par seconde (défaut 10)
+//   --fps     : frames par seconde (défaut 1 sur Wayland, 10 sur X11)
 //   --quality : qualité JPEG 1-100 (défaut 60)
 //   --scale   : échelle 0.1-1 (défaut 0.8)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,15 +34,44 @@ const getArg = (name) => {
 
 const SERVER_URL  = getArg('--server')  || process.env.REMOTE_SERVER_URL || 'ws://localhost:3000';
 const SESSION_ID  = getArg('--session') || process.env.REMOTE_SESSION_ID || 'default';
-const FPS         = parseInt(getArg('--fps')     || '10');
 const QUALITY     = parseInt(getArg('--quality') || '60');
 const SCALE       = parseFloat(getArg('--scale') || '0.8');
+
+// ── Environnement graphique ───────────────────────────────────────────────────
+const DISPLAY         = process.env.DISPLAY         || ':0';
+const WAYLAND_DISPLAY = process.env.WAYLAND_DISPLAY || 'wayland-0';
+const XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`;
+const DBUS_ADDR       = process.env.DBUS_SESSION_BUS_ADDRESS
+                        || `unix:path=${XDG_RUNTIME_DIR}/bus`;
+
+const GFX_ENV = {
+  ...process.env,
+  DISPLAY,
+  WAYLAND_DISPLAY,
+  XDG_RUNTIME_DIR,
+  DBUS_SESSION_BUS_ADDRESS: DBUS_ADDR,
+};
+
+// ── Détection de la méthode de capture ───────────────────────────────────────
+let captureMethod = 'scrot'; // défaut
+
+try {
+  await execFileAsync('which', ['gnome-screenshot']);
+  captureMethod = 'gnome-screenshot';
+} catch {}
+
+// Ajuster le FPS par défaut selon la méthode
+// gnome-screenshot prend ~1.3s → max 1fps réaliste
+// scrot prend ~0.1s → 10fps possible
+const DEFAULT_FPS = captureMethod === 'gnome-screenshot' ? 1 : 10;
+const FPS         = parseInt(getArg('--fps') || String(DEFAULT_FPS));
 const INTERVAL_MS = Math.round(1000 / FPS);
 
 console.log(`\n🖥️  Agent Bureau à Distance — NexConf`);
 console.log(`   Serveur  : ${SERVER_URL}`);
 console.log(`   Session  : ${SESSION_ID}`);
 console.log(`   FPS      : ${FPS} | Qualité : ${QUALITY}% | Scale : ${SCALE}`);
+console.log(`   Capture  : ${captureMethod}`);
 console.log(`\n   Connexion en cours…\n`);
 
 // ── Configuration RobotJS ─────────────────────────────────────────────────────
@@ -63,35 +92,6 @@ const SPECIAL_KEYS = {
   ' ':'space','Control':'control','Alt':'alt','Shift':'shift','Meta':'command',
 };
 
-// ── Détection de la méthode de capture ───────────────────────────────────────
-// Ordre de priorité :
-//   1. gnome-screenshot  → Wayland/GNOME (Ubuntu récent)
-//   2. scrot             → X11 classique
-const DISPLAY          = process.env.DISPLAY          || ':0';
-const WAYLAND_DISPLAY  = process.env.WAYLAND_DISPLAY  || 'wayland-0';
-const XDG_RUNTIME_DIR  = process.env.XDG_RUNTIME_DIR  || `/run/user/${process.getuid()}`;
-const DBUS_ADDR        = process.env.DBUS_SESSION_BUS_ADDRESS
-                         || `unix:path=${XDG_RUNTIME_DIR}/bus`;
-
-// Environnement complet pour les outils graphiques
-const GFX_ENV = {
-  ...process.env,
-  DISPLAY,
-  WAYLAND_DISPLAY,
-  XDG_RUNTIME_DIR,
-  DBUS_SESSION_BUS_ADDRESS: DBUS_ADDR,
-};
-
-// Détecter gnome-screenshot au démarrage
-let useGnomeScreenshot = false;
-try {
-  await execFileAsync('which', ['gnome-screenshot']);
-  useGnomeScreenshot = true;
-  console.log('📸  Capture : gnome-screenshot (Wayland/GNOME)');
-} catch {
-  console.log('📸  Capture : scrot (X11)');
-}
-
 // ── Capture écran ─────────────────────────────────────────────────────────────
 let frameInProgress = false;
 
@@ -101,14 +101,13 @@ async function captureFrame() {
 
   const tmpFile = join(tmpdir(), `nexconf_${Date.now()}.png`);
   try {
-    if (useGnomeScreenshot) {
-      // gnome-screenshot : fonctionne sur Wayland/GNOME
-      await execFileAsync('gnome-screenshot', ['-f', tmpFile], {
+    if (captureMethod === 'gnome-screenshot') {
+      // -d 0 : sans délai, le plus rapide possible (~1.3s sur Wayland)
+      await execFileAsync('gnome-screenshot', ['-d', '0', '-f', tmpFile], {
         env:     GFX_ENV,
-        timeout: 4000,
+        timeout: 5000,
       });
     } else {
-      // scrot : fonctionne sur X11 classique
       await execFileAsync('scrot', ['-z', tmpFile], {
         env:     GFX_ENV,
         timeout: 3000,
@@ -129,7 +128,6 @@ async function captureFrame() {
       }));
     }
   } catch (e) {
-    // Silencieux en production — décommenter pour déboguer :
     // console.error('❌ captureFrame:', e.message);
   } finally {
     frameInProgress = false;
@@ -140,7 +138,7 @@ async function captureFrame() {
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 let ws;
 let streaming        = false;
-let streamInterval   = null;
+let streamTimer      = null;
 let reconnectTimeout = null;
 
 function connect() {
@@ -229,19 +227,32 @@ function handleCommand(msg) {
   }
 }
 
-// ── Streaming ─────────────────────────────────────────────────────────────────
+// ── Streaming — chaîne séquentielle pour gnome-screenshot ────────────────────
+// Avec gnome-screenshot (~1.3s/frame), on enchaîne les captures
+// sans setInterval pour éviter les chevauchements.
+async function streamLoop() {
+  while (streaming) {
+    const t0 = Date.now();
+    await captureFrame();
+    const elapsed = Date.now() - t0;
+    const wait    = Math.max(0, INTERVAL_MS - elapsed);
+    if (wait > 0 && streaming) {
+      await new Promise(r => { streamTimer = setTimeout(r, wait); });
+    }
+  }
+}
+
 function startStream() {
   if (streaming) return;
   streaming = true;
   console.log('🎥  Stream démarré');
-  captureFrame();
-  streamInterval = setInterval(captureFrame, INTERVAL_MS);
+  streamLoop();
 }
 
 function stopStream() {
   if (!streaming) return;
   streaming = false;
-  if (streamInterval) { clearInterval(streamInterval); streamInterval = null; }
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
   console.log('⏹️   Stream arrêté');
 }
 
