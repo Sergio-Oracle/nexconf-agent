@@ -1,16 +1,15 @@
 #!/bin/bash
+set -e
 
 echo "🚀 Installation NexConf Agent..."
 
 apt update
 apt install -y git nodejs npm build-essential python3 make g++
 
-if [ ! -d "nexconf-agent" ]; then
-  git clone https://github.com/Sergio-Oracle/nexconf-agent.git
-fi
+echo ""
+echo "📦 Installation des dépendances Node..."
 
-cd nexconf-agent
-
+cd "$(dirname "$0")"
 npm install
 
 echo ""
