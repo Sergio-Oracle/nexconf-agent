@@ -1,7 +1,16 @@
 // ─── remote-agent.js ─────────────────────────────────────────────────────────
 // Agent Bureau à Distance — NexConf
-// Capture l'écran via scrot (Linux), streame vers le serveur relais,
-// et exécute les commandes souris/clavier via RobotJS.
+//
+// Capture l'écran via gnome-screenshot (Wayland/GNOME) ou scrot (X11),
+// streame vers le serveur relais, et exécute les commandes souris/clavier.
+//
+// Usage :
+//   node remote-agent.js --server wss://nexconf.ddns.net --session VOTRE_CODE
+//
+// Options :
+//   --fps     : frames par seconde (défaut 10)
+//   --quality : qualité JPEG 1-100 (défaut 60)
+//   --scale   : échelle 0.1-1 (défaut 0.8)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config';
@@ -54,9 +63,37 @@ const SPECIAL_KEYS = {
   ' ':'space','Control':'control','Alt':'alt','Shift':'shift','Meta':'command',
 };
 
-// ── Capture écran via scrot ───────────────────────────────────────────────────
-const DISPLAY      = process.env.DISPLAY || ':0';
-let   frameInProgress = false;
+// ── Détection de la méthode de capture ───────────────────────────────────────
+// Ordre de priorité :
+//   1. gnome-screenshot  → Wayland/GNOME (Ubuntu récent)
+//   2. scrot             → X11 classique
+const DISPLAY          = process.env.DISPLAY          || ':0';
+const WAYLAND_DISPLAY  = process.env.WAYLAND_DISPLAY  || 'wayland-0';
+const XDG_RUNTIME_DIR  = process.env.XDG_RUNTIME_DIR  || `/run/user/${process.getuid()}`;
+const DBUS_ADDR        = process.env.DBUS_SESSION_BUS_ADDRESS
+                         || `unix:path=${XDG_RUNTIME_DIR}/bus`;
+
+// Environnement complet pour les outils graphiques
+const GFX_ENV = {
+  ...process.env,
+  DISPLAY,
+  WAYLAND_DISPLAY,
+  XDG_RUNTIME_DIR,
+  DBUS_SESSION_BUS_ADDRESS: DBUS_ADDR,
+};
+
+// Détecter gnome-screenshot au démarrage
+let useGnomeScreenshot = false;
+try {
+  await execFileAsync('which', ['gnome-screenshot']);
+  useGnomeScreenshot = true;
+  console.log('📸  Capture : gnome-screenshot (Wayland/GNOME)');
+} catch {
+  console.log('📸  Capture : scrot (X11)');
+}
+
+// ── Capture écran ─────────────────────────────────────────────────────────────
+let frameInProgress = false;
 
 async function captureFrame() {
   if (frameInProgress) return;
@@ -64,10 +101,19 @@ async function captureFrame() {
 
   const tmpFile = join(tmpdir(), `nexconf_${Date.now()}.png`);
   try {
-    await execFileAsync('scrot', ['-z', tmpFile], {
-      env:     { ...process.env, DISPLAY },
-      timeout: 3000,
-    });
+    if (useGnomeScreenshot) {
+      // gnome-screenshot : fonctionne sur Wayland/GNOME
+      await execFileAsync('gnome-screenshot', ['-f', tmpFile], {
+        env:     GFX_ENV,
+        timeout: 4000,
+      });
+    } else {
+      // scrot : fonctionne sur X11 classique
+      await execFileAsync('scrot', ['-z', tmpFile], {
+        env:     GFX_ENV,
+        timeout: 3000,
+      });
+    }
 
     const buf  = await readFile(tmpFile);
     const jpeg = await sharp(buf)
@@ -76,10 +122,15 @@ async function captureFrame() {
       .toBuffer();
 
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'frame', data: jpeg.toString('base64'), ts: Date.now() }));
+      ws.send(JSON.stringify({
+        type: 'frame',
+        data: jpeg.toString('base64'),
+        ts:   Date.now(),
+      }));
     }
   } catch (e) {
-    // silencieux
+    // Silencieux en production — décommenter pour déboguer :
+    // console.error('❌ captureFrame:', e.message);
   } finally {
     frameInProgress = false;
     try { await unlink(tmpFile); } catch {}
@@ -128,7 +179,10 @@ function handleCommand(msg) {
     case 'stop-stream':  stopStream();  break;
 
     case 'mouse-move':
-      robot.moveMouse(Math.round(msg.x * screen.width), Math.round(msg.y * screen.height));
+      robot.moveMouse(
+        Math.round(msg.x * screen.width),
+        Math.round(msg.y * screen.height)
+      );
       break;
 
     case 'mouse-click': {
@@ -139,12 +193,18 @@ function handleCommand(msg) {
       break;
     }
     case 'mouse-down':
-      robot.moveMouse(Math.round(msg.x * screen.width), Math.round(msg.y * screen.height));
+      robot.moveMouse(
+        Math.round(msg.x * screen.width),
+        Math.round(msg.y * screen.height)
+      );
       robot.mouseToggle('down', 'left');
       break;
 
     case 'mouse-up':
-      robot.moveMouse(Math.round(msg.x * screen.width), Math.round(msg.y * screen.height));
+      robot.moveMouse(
+        Math.round(msg.x * screen.width),
+        Math.round(msg.y * screen.height)
+      );
       robot.mouseToggle('up', 'left');
       break;
 
