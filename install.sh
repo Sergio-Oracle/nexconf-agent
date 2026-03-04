@@ -3,9 +3,9 @@ set -e
 
 echo "🚀 Installation NexConf Agent..."
 
-# ── Dépendances système de base ───────────────────────────────────
+# ── Dépendances système ───────────────────────────────────────────
 apt update
-apt install -y git curl build-essential python3 make g++
+apt install -y git curl build-essential python3 make g++ scrot
 
 # ── Vérification version Node.js (besoin de >= 18) ───────────────
 NODE_OK=false
@@ -31,7 +31,7 @@ fi
 
 echo "📦 Node.js : $(node -v) | npm : $(npm -v)"
 
-# ── Installation des dépendances dans le dossier du script ───────
+# ── Installation des dépendances npm ─────────────────────────────
 cd "$(dirname "$0")"
 echo "📦 Installation des dépendances npm dans $(pwd)..."
 npm install
