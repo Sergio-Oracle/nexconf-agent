@@ -205,7 +205,7 @@ let reconnectTimeout = null;
 
 function connect() {
   const url = `${SERVER_URL}/ws/agent?session=${encodeURIComponent(SESSION_ID)}`;
-  ws = new WebSocket(url, { rejectUnauthorized: false });
+  ws = new WebSocket(url, { rejectUnauthorized: false, perMessageDeflate: false });
 
   ws.on('open', () => {
     console.log(`✅  Connecté au serveur relais`);
