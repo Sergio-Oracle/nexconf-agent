@@ -1,46 +1,51 @@
 // ─── remote-agent.js ─────────────────────────────────────────────────────────
-// Agent Bureau à Distance — NexConf
+// Agent Bureau à Distance — NexConf v4
 //
-// Capture l'écran via gnome-screenshot (Wayland/GNOME) ou scrot (X11),
-// streame vers le serveur relais, et exécute les commandes souris/clavier.
+// VIDÉO    : ffmpeg capture l'écran (x11grab) → stream LiveKit (WebRTC/H.264)
+// CONTRÔLE : WebSocket → serveur relais → RobotJS (souris + clavier)
+//
+// Prérequis sur la machine agent (rtn) :
+//   sudo apt install -y ffmpeg
+//   # Installer lk-cli :
+//   wget https://github.com/livekit/livekit-cli/releases/download/v2.4.4/lk_linux_amd64.tar.gz
+//   tar -xzf lk_linux_amd64.tar.gz && sudo mv lk /usr/local/bin/ && rm lk_linux_amd64.tar.gz
 //
 // Usage :
+//   export XDG_RUNTIME_DIR=/run/user/1001
+//   export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+//   export WAYLAND_DISPLAY=wayland-0
 //   node remote-agent.js --server wss://nexconf.ddns.net --session VOTRE_CODE
 //
 // Options :
-//   --fps     : frames par seconde (défaut 1 sur Wayland, 10 sur X11)
-//   --quality : qualité JPEG 1-100 (défaut 60)
-//   --scale   : échelle 0.1-1 (défaut 0.8)
+//   --fps     : frames par seconde (défaut 15)
+//   --scale   : échelle écran 0.1-1.0 pour le contrôle souris (défaut 1.0)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config';
-import WebSocket            from 'ws';
-import sharp                from 'sharp';
-import robot                from 'robotjs';
-import { execFile }         from 'child_process';
-import { promisify }        from 'util';
-import { readFile, unlink } from 'fs/promises';
-import { tmpdir }           from 'os';
-import { join }             from 'path';
+import WebSocket           from 'ws';
+import robot               from 'robotjs';
+import { execFile, spawn } from 'child_process';
+import { promisify }       from 'util';
 
 const execFileAsync = promisify(execFile);
 
 // ── Arguments CLI ─────────────────────────────────────────────────────────────
-const args = process.argv.slice(2);
-const getArg = (name) => {
-  const idx = args.indexOf(name);
-  return idx !== -1 ? args[idx + 1] : null;
-};
+const args   = process.argv.slice(2);
+const getArg = (name) => { const i = args.indexOf(name); return i !== -1 ? args[i + 1] : null; };
 
-const SERVER_URL  = getArg('--server')  || process.env.REMOTE_SERVER_URL || 'ws://localhost:3000';
-const SESSION_ID  = getArg('--session') || process.env.REMOTE_SESSION_ID || 'default';
-const QUALITY     = parseInt(getArg('--quality') || '60');
-const SCALE       = parseFloat(getArg('--scale') || '0.8');
+const SERVER_URL = getArg('--server')  || process.env.REMOTE_SERVER_URL || 'wss://nexconf.ddns.net';
+const SESSION_ID = getArg('--session') || process.env.REMOTE_SESSION_ID || 'default';
+const FPS        = parseInt(getArg('--fps')   || '15');
+const SCALE      = parseFloat(getArg('--scale') || '1.0');
+
+// URL HTTP du serveur pour récupérer le token LiveKit
+const NEXCONF_HTTP = SERVER_URL.replace('wss://', 'https://').replace('ws://', 'http://');
+const LIVEKIT_URL  = process.env.LIVEKIT_URL || 'wss://livekit.ec2lt.sn';
 
 // ── Environnement graphique ───────────────────────────────────────────────────
 const DISPLAY         = process.env.DISPLAY         || ':0';
 const WAYLAND_DISPLAY = process.env.WAYLAND_DISPLAY || 'wayland-0';
-const XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`;
+const XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR || '/run/user/1001';
 const DBUS_ADDR       = process.env.DBUS_SESSION_BUS_ADDRESS
                         || `unix:path=${XDG_RUNTIME_DIR}/bus`;
 
@@ -52,35 +57,10 @@ const GFX_ENV = {
   DBUS_SESSION_BUS_ADDRESS: DBUS_ADDR,
 };
 
-// ── Détection de la méthode de capture ───────────────────────────────────────
-let captureMethod = 'scrot'; // défaut
-
-try {
-  await execFileAsync('which', ['gnome-screenshot']);
-  captureMethod = 'gnome-screenshot';
-} catch {}
-
-// Ajuster le FPS par défaut selon la méthode
-// gnome-screenshot prend ~1.3s → max 1fps réaliste
-// scrot prend ~0.1s → 10fps possible
-const DEFAULT_FPS = captureMethod === 'gnome-screenshot' ? 1 : 10;
-const FPS         = parseInt(getArg('--fps') || String(DEFAULT_FPS));
-const INTERVAL_MS = Math.round(1000 / FPS);
-
-console.log(`\n🖥️  Agent Bureau à Distance — NexConf`);
-console.log(`   Serveur  : ${SERVER_URL}`);
-console.log(`   Session  : ${SESSION_ID}`);
-console.log(`   FPS      : ${FPS} | Qualité : ${QUALITY}% | Scale : ${SCALE}`);
-console.log(`   Capture  : ${captureMethod}`);
-console.log(`\n   Connexion en cours…\n`);
-
-// ── Configuration RobotJS ─────────────────────────────────────────────────────
+// ── RobotJS ───────────────────────────────────────────────────────────────────
 robot.setMouseDelay(0);
 robot.setKeyboardDelay(0);
-
-const screen   = robot.getScreenSize();
-const SCREEN_W = Math.round(screen.width  * SCALE);
-const SCREEN_H = Math.round(screen.height * SCALE);
+const screen = robot.getScreenSize();
 
 // ── Touches spéciales ─────────────────────────────────────────────────────────
 const SPECIAL_KEYS = {
@@ -92,53 +72,135 @@ const SPECIAL_KEYS = {
   ' ':'space','Control':'control','Alt':'alt','Shift':'shift','Meta':'command',
 };
 
-// ── Capture écran ─────────────────────────────────────────────────────────────
-let frameInProgress = false;
+console.log(`\n🖥️  NexConf Agent v4`);
+console.log(`   Serveur   : ${SERVER_URL}`);
+console.log(`   Session   : ${SESSION_ID}`);
+console.log(`   FPS       : ${FPS}`);
+console.log(`   Écran     : ${screen.width}x${screen.height}`);
+console.log(`   LiveKit   : ${LIVEKIT_URL}`);
+console.log(`\n   Connexion en cours…\n`);
 
-async function captureFrame() {
-  if (frameInProgress) return;
-  frameInProgress = true;
-
-  const tmpFile = join(tmpdir(), `nexconf_${Date.now()}.png`);
-  try {
-    if (captureMethod === 'gnome-screenshot') {
-      // -d 0 : sans délai, le plus rapide possible (~1.3s sur Wayland)
-      await execFileAsync('gnome-screenshot', ['-d', '0', '-f', tmpFile], {
-        env:     GFX_ENV,
-        timeout: 5000,
-      });
-    } else {
-      await execFileAsync('scrot', ['-z', tmpFile], {
-        env:     GFX_ENV,
-        timeout: 3000,
-      });
-    }
-
-    const buf  = await readFile(tmpFile);
-    const jpeg = await sharp(buf)
-      .resize(SCREEN_W, SCREEN_H, { fit: 'fill' })
-      .jpeg({ quality: QUALITY })
-      .toBuffer();
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: 'frame',
-        data: jpeg.toString('base64'),
-        ts:   Date.now(),
-      }));
-    }
-  } catch (e) {
-    // console.error('❌ captureFrame:', e.message);
-  } finally {
-    frameInProgress = false;
-    try { await unlink(tmpFile); } catch {}
-  }
+// ── Récupérer un token LiveKit ────────────────────────────────────────────────
+async function getLiveKitToken(room, identity) {
+  const url = `${NEXCONF_HTTP}/api/token?room=${encodeURIComponent(room)}&username=${encodeURIComponent(identity)}`;
+  const res  = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`Token HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.token) throw new Error('Pas de token dans la réponse');
+  return data.token;
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+// ── Stream LiveKit via ffmpeg + lk publish ────────────────────────────────────
+let ffmpegProc   = null;
+let lkProc       = null;
+let streamActive = false;
+
+async function startLiveKitStream() {
+  if (streamActive) return;
+
+  const room     = `remote-${SESSION_ID}`;
+  const identity = `agent-${SESSION_ID}`;
+
+  try {
+    // Vérifier que ffmpeg est installé
+    await execFileAsync('which', ['ffmpeg']);
+  } catch {
+    console.error('❌ ffmpeg introuvable — installez-le : sudo apt install -y ffmpeg');
+    return;
+  }
+
+  try {
+    // Vérifier que lk-cli est installé
+    await execFileAsync('which', ['lk']);
+  } catch {
+    console.error('❌ lk-cli introuvable — voir install.sh pour l\'installation');
+    return;
+  }
+
+  let token;
+  try {
+    token = await getLiveKitToken(room, identity);
+    console.log(`🔑  Token LiveKit obtenu → room: ${room}`);
+  } catch (err) {
+    console.error('❌ Impossible d\'obtenir le token LiveKit:', err.message);
+    return;
+  }
+
+  // ── ffmpeg : capture x11grab → mp4 fragmented sur stdout ──────────────────
+  // x11grab fonctionne sur XWayland (:0) et X11 classique
+  ffmpegProc = spawn('ffmpeg', [
+    '-loglevel', 'warning',
+    // Source : capture X11/XWayland
+    '-f',         'x11grab',
+    '-framerate', String(FPS),
+    '-i',         DISPLAY,
+    // Encodage H.264 ultrafast zerolatency
+    '-vf',        'scale=trunc(iw/2)*2:trunc(ih/2)*2',  // dimensions paires obligatoires
+    '-vcodec',    'libx264',
+    '-preset',    'ultrafast',
+    '-tune',      'zerolatency',
+    '-crf',       '28',
+    '-g',         String(FPS * 2),   // keyframe toutes les 2s
+    '-pix_fmt',   'yuv420p',
+    // Sortie mp4 fragmented (compatible streaming pipe)
+    '-f',         'mp4',
+    '-movflags',  'frag_keyframe+empty_moov+default_base_moof',
+    'pipe:1',
+  ], { env: GFX_ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+
+  // ── lk publish-file : reçoit le mp4 depuis stdin et publie sur LiveKit ─────
+  lkProc = spawn('lk', [
+    'room', 'join',
+    '--url',      LIVEKIT_URL,
+    '--token',    token,
+    '--publish',  'pipe:0',
+    '--identity', identity,
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  // Pipeline ffmpeg stdout → lk stdin
+  ffmpegProc.stdout.pipe(lkProc.stdin);
+
+  ffmpegProc.stderr.on('data', (d) => {
+    const line = d.toString().trim();
+    if (line && !line.startsWith('frame=')) console.log('[ffmpeg]', line);
+    else if (line) process.stdout.write(`\r🎥  ${line}`);
+  });
+
+  lkProc.stdout.on('data', (d) => console.log('[lk]', d.toString().trim()));
+  lkProc.stderr.on('data', (d) => {
+    const line = d.toString().trim();
+    if (line) console.log('[lk]', line);
+  });
+
+  ffmpegProc.on('close', (code) => {
+    console.log(`\n⏹️  ffmpeg terminé (code ${code})`);
+    streamActive = false;
+    lkProc?.kill('SIGTERM');
+  });
+
+  lkProc.on('close', (code) => {
+    console.log(`⏹️  lk terminé (code ${code})`);
+    streamActive = false;
+    ffmpegProc?.kill('SIGTERM');
+  });
+
+  lkProc.on('error', (err) => console.error('❌ lk erreur:', err.message));
+  ffmpegProc.on('error', (err) => console.error('❌ ffmpeg erreur:', err.message));
+
+  streamActive = true;
+  console.log(`✅  Stream LiveKit démarré → room: ${room} @ ${FPS}fps`);
+}
+
+function stopLiveKitStream() {
+  if (!streamActive) return;
+  streamActive = false;
+  ffmpegProc?.kill('SIGTERM'); ffmpegProc = null;
+  lkProc?.kill('SIGTERM');     lkProc     = null;
+  console.log('⏹️  Stream LiveKit arrêté');
+}
+
+// ── WebSocket — canal de contrôle souris/clavier ──────────────────────────────
 let ws;
-let streaming        = false;
-let streamTimer      = null;
 let reconnectTimeout = null;
 
 function connect() {
@@ -147,8 +209,16 @@ function connect() {
 
   ws.on('open', () => {
     console.log(`✅  Connecté au serveur relais`);
+    // Envoyer les infos écran + room LiveKit au viewer
+    send({
+      type:    'screen-info',
+      width:   screen.width,
+      height:  screen.height,
+      scale:   SCALE,
+      lkRoom:  `remote-${SESSION_ID}`,
+      lkUrl:   LIVEKIT_URL,
+    });
     console.log(`   En attente d'un visualiseur…\n`);
-    send({ type: 'screen-info', width: SCREEN_W, height: SCREEN_H, scale: SCALE });
   });
 
   ws.on('message', (raw) => {
@@ -156,26 +226,31 @@ function connect() {
   });
 
   ws.on('close', () => {
-    console.log('⚠️   Connexion perdue. Reconnexion dans 3s…');
-    stopStream();
+    console.log('⚠️  Connexion perdue. Reconnexion dans 3s…');
+    stopLiveKitStream();
     reconnectTimeout = setTimeout(connect, 3000);
   });
 
-  ws.on('error', (err) => {
-    console.error('❌  Erreur WebSocket :', err.message);
-  });
+  ws.on('error', (err) => console.error('❌ WebSocket:', err.message));
 }
 
 function send(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
 // ── Commandes reçues ──────────────────────────────────────────────────────────
 function handleCommand(msg) {
   switch (msg.type) {
-    case 'start-stream': startStream(); break;
-    case 'stop-stream':  stopStream();  break;
 
+    case 'start-stream':
+      startLiveKitStream();
+      break;
+
+    case 'stop-stream':
+      stopLiveKitStream();
+      break;
+
+    // ── Souris ──────────────────────────────────────────────────
     case 'mouse-move':
       robot.moveMouse(
         Math.round(msg.x * screen.width),
@@ -190,12 +265,13 @@ function handleCommand(msg) {
       robot.mouseClick(msg.button === 2 ? 'right' : 'left', msg.double || false);
       break;
     }
+
     case 'mouse-down':
       robot.moveMouse(
         Math.round(msg.x * screen.width),
         Math.round(msg.y * screen.height)
       );
-      robot.mouseToggle('down', 'left');
+      robot.mouseToggle('down', msg.button === 2 ? 'right' : 'left');
       break;
 
     case 'mouse-up':
@@ -203,15 +279,16 @@ function handleCommand(msg) {
         Math.round(msg.x * screen.width),
         Math.round(msg.y * screen.height)
       );
-      robot.mouseToggle('up', 'left');
+      robot.mouseToggle('up', msg.button === 2 ? 'right' : 'left');
       break;
 
     case 'mouse-scroll':
       robot.scrollMouse(msg.dx || 0, msg.dy || 0);
       break;
 
+    // ── Clavier ─────────────────────────────────────────────────
     case 'key-press': {
-      const key  = SPECIAL_KEYS[msg.key] || (msg.key.length === 1 ? msg.key.toLowerCase() : null);
+      const key = SPECIAL_KEYS[msg.key] || (msg.key.length === 1 ? msg.key.toLowerCase() : null);
       if (!key) break;
       const mods = [];
       if (msg.ctrl)  mods.push('control');
@@ -221,39 +298,11 @@ function handleCommand(msg) {
       try { mods.length ? robot.keyTap(key, mods) : robot.keyTap(key); } catch {}
       break;
     }
+
     case 'type-text':
       if (msg.text) try { robot.typeString(msg.text); } catch {}
       break;
   }
-}
-
-// ── Streaming — chaîne séquentielle pour gnome-screenshot ────────────────────
-// Avec gnome-screenshot (~1.3s/frame), on enchaîne les captures
-// sans setInterval pour éviter les chevauchements.
-async function streamLoop() {
-  while (streaming) {
-    const t0 = Date.now();
-    await captureFrame();
-    const elapsed = Date.now() - t0;
-    const wait    = Math.max(0, INTERVAL_MS - elapsed);
-    if (wait > 0 && streaming) {
-      await new Promise(r => { streamTimer = setTimeout(r, wait); });
-    }
-  }
-}
-
-function startStream() {
-  if (streaming) return;
-  streaming = true;
-  console.log('🎥  Stream démarré');
-  streamLoop();
-}
-
-function stopStream() {
-  if (!streaming) return;
-  streaming = false;
-  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
-  console.log('⏹️   Stream arrêté');
 }
 
 // ── Démarrage ─────────────────────────────────────────────────────────────────
@@ -261,7 +310,7 @@ connect();
 
 process.on('SIGINT', () => {
   console.log('\n👋  Arrêt de l\'agent…');
-  stopStream();
+  stopLiveKitStream();
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
   if (ws) ws.close();
   process.exit(0);

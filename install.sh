@@ -1,43 +1,110 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ─── install.sh ──────────────────────────────────────────────────────────────
+# NexConf Agent — Installation complète
+# Usage : bash install.sh
+# ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-echo "🚀 Installation NexConf Agent..."
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║        NexConf Agent — Installation v4           ║"
+echo "╚══════════════════════════════════════════════════╝"
+echo ""
 
-# ── Dépendances système ───────────────────────────────────────────
-apt update
-apt install -y git curl build-essential python3 make g++ scrot
+# ── 1. Dépendances système ────────────────────────────────────────────────────
+echo "📦 Installation des dépendances système…"
+sudo apt-get update -qq
+sudo apt-get install -y \
+  git curl build-essential python3 make g++ \
+  ffmpeg \
+  scrot gnome-screenshot \
+  xdotool
+echo "✅ Dépendances système OK"
 
-# ── Vérification version Node.js (besoin de >= 18) ───────────────
-NODE_OK=false
-if command -v node &>/dev/null; then
-  MAJOR=$(node -e "console.log(parseInt(process.versions.node.split('.')[0]))" 2>/dev/null)
-  if [ "$MAJOR" -ge 18 ] 2>/dev/null; then
-    echo "✅ Node.js $MAJOR détecté — OK"
-    NODE_OK=true
-  else
-    echo "⚠️  Node.js $MAJOR détecté — trop ancien (besoin >= 18)"
+# ── 2. Node.js via nvm ────────────────────────────────────────────────────────
+if ! command -v node &>/dev/null || [[ "$(node -e 'process.exit(parseInt(process.version.slice(1)) < 20 ? 1 : 0)' ; echo $?)" == "1" ]]; then
+  echo "📦 Installation de Node.js 20 via nvm…"
+  export NVM_DIR="$HOME/.nvm"
+  if [ ! -d "$NVM_DIR" ]; then
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
   fi
-else
-  echo "⚠️  Node.js non trouvé"
-fi
-
-# ── Installation Node.js 20 LTS via NodeSource si nécessaire ─────
-if [ "$NODE_OK" = false ]; then
-  echo "📦 Installation de Node.js 20 LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt install -y nodejs
+  source "$NVM_DIR/nvm.sh"
+  nvm install 20
+  nvm use 20
+  nvm alias default 20
   echo "✅ Node.js $(node -v) installé"
+else
+  echo "✅ Node.js $(node -v) déjà installé"
 fi
 
-echo "📦 Node.js : $(node -v) | npm : $(npm -v)"
+# ── 3. lk-cli (LiveKit CLI) ───────────────────────────────────────────────────
+if ! command -v lk &>/dev/null; then
+  echo "📦 Installation de lk-cli (LiveKit)…"
+  LK_VERSION="v2.4.4"
+  LK_ARCH="amd64"
+  # Détection architecture
+  case "$(uname -m)" in
+    aarch64|arm64) LK_ARCH="arm64" ;;
+    armv7l)        LK_ARCH="arm"   ;;
+  esac
+  LK_URL="https://github.com/livekit/livekit-cli/releases/download/${LK_VERSION}/lk_linux_${LK_ARCH}.tar.gz"
+  echo "   Téléchargement: $LK_URL"
+  curl -L "$LK_URL" -o /tmp/lk.tar.gz
+  tar -xzf /tmp/lk.tar.gz -C /tmp/
+  sudo mv /tmp/lk /usr/local/bin/lk
+  sudo chmod +x /usr/local/bin/lk
+  rm -f /tmp/lk.tar.gz
+  echo "✅ lk-cli $(lk --version 2>/dev/null || echo 'installé') OK"
+else
+  echo "✅ lk-cli déjà installé : $(lk --version 2>/dev/null || echo 'OK')"
+fi
 
-# ── Installation des dépendances npm ─────────────────────────────
-cd "$(dirname "$0")"
-echo "📦 Installation des dépendances npm dans $(pwd)..."
+# ── 4. Dépendances Node.js du projet ─────────────────────────────────────────
+echo "📦 Installation des modules Node.js…"
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
 npm install
+echo "✅ Modules Node.js OK"
+
+# ── 5. Fichier .env si absent ─────────────────────────────────────────────────
+if [ ! -f .env ]; then
+  echo "📝 Création du fichier .env…"
+  cat > .env << 'ENV'
+# Serveur NexConf relais
+REMOTE_SERVER_URL=wss://nexconf.ddns.net
+
+# LiveKit
+LIVEKIT_URL=wss://livekit.ec2lt.sn
+ENV
+  echo "✅ .env créé"
+fi
+
+# ── 6. Vérifications ──────────────────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║              Vérifications finales               ║"
+echo "╚══════════════════════════════════════════════════╝"
+echo ""
+echo -n "   Node.js    : "; node -v 2>/dev/null || echo "❌ absent"
+echo -n "   npm        : "; npm -v  2>/dev/null || echo "❌ absent"
+echo -n "   ffmpeg     : "; ffmpeg -version 2>&1 | head -1 || echo "❌ absent"
+echo -n "   lk-cli     : "; lk --version 2>/dev/null || echo "❌ absent"
+echo -n "   scrot       : "; which scrot       &>/dev/null && echo "✅" || echo "⚠️ absent (fallback)"
+echo -n "   gnome-shot  : "; which gnome-screenshot &>/dev/null && echo "✅" || echo "⚠️ absent (fallback)"
 
 echo ""
-echo "✅ Installation terminée !"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║              Installation terminée !             ║"
+echo "╠══════════════════════════════════════════════════╣"
+echo "║  Lancer l'agent (en tant que sergio) :           ║"
+echo "║                                                  ║"
+echo "║  export XDG_RUNTIME_DIR=/run/user/1001           ║"
+echo "║  export WAYLAND_DISPLAY=wayland-0                ║"
+echo "║  export DBUS_SESSION_BUS_ADDRESS=                ║"
+echo "║    unix:path=/run/user/1001/bus                  ║"
+echo "║                                                  ║"
+echo "║  node remote-agent.js \\                          ║"
+echo "║    --server wss://nexconf.ddns.net \\             ║"
+echo "║    --session VOTRE_CODE                          ║"
+echo "╚══════════════════════════════════════════════════╝"
 echo ""
-echo "▶ Pour lancer l'agent :"
-echo "  node remote-agent.js --server wss://nexconf.ddns.net --session VOTRE_SESSION"
