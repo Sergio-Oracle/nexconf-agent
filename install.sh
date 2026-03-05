@@ -40,14 +40,21 @@ fi
 # ── 3. lk-cli (LiveKit CLI) ───────────────────────────────────────────────────
 if ! command -v lk &>/dev/null; then
   echo "📦 Installation de lk-cli (LiveKit)…"
-  LK_VERSION="v2.4.4"
   LK_ARCH="amd64"
   # Détection architecture
   case "$(uname -m)" in
     aarch64|arm64) LK_ARCH="arm64" ;;
     armv7l)        LK_ARCH="arm"   ;;
   esac
-  LK_URL="https://github.com/livekit/livekit-cli/releases/download/${LK_VERSION}/lk_linux_${LK_ARCH}.tar.gz"
+  # Récupérer la dernière version dynamiquement
+  LK_VERSION=$(curl -s https://api.github.com/repos/livekit/livekit-cli/releases/latest \
+    | grep -o '"tag_name": "v[^"]*"' | grep -o 'v[^"]*' | sed 's/^v//')
+  if [ -z "$LK_VERSION" ]; then
+    LK_VERSION="2.14.0"  # fallback si l'API est indisponible
+  fi
+  # Format correct : lk_VERSION_linux_ARCH.tar.gz
+  LK_URL="https://github.com/livekit/livekit-cli/releases/download/v${LK_VERSION}/lk_${LK_VERSION}_linux_${LK_ARCH}.tar.gz"
+  echo "   Version: v${LK_VERSION}"
   echo "   Téléchargement: $LK_URL"
   curl -L "$LK_URL" -o /tmp/lk.tar.gz
   tar -xzf /tmp/lk.tar.gz -C /tmp/
